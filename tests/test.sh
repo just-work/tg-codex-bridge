@@ -19,6 +19,7 @@ export TGCB_FAKE_LIFECYCLE="$SANDBOX/lifecycle"
 export TGCB_FAKE_FAIL_BOOTOUT="$SANDBOX/fail-bootout"
 export TGCB_FAKE_CALLS="$SANDBOX/calls"
 export TGCB_FAKE_PROMPT="$SANDBOX/prompt"
+export TGCB_FAKE_PROMPTS="$SANDBOX/prompts"
 export TGCB_FAKE_THREADS="$SANDBOX/threads"
 export TGCB_FAKE_UPDATES="$SANDBOX/updates.json"
 export TGCB_FAKE_MESSAGES="$SANDBOX/messages"
@@ -52,6 +53,7 @@ else
   message=$(printf '%s\n' "$request" | sed -n 's/^data-urlencode = "text@\(.*\)"$/\1/p')
   cat "$message" >> "$TGCB_FAKE_MESSAGES"
   echo >> "$TGCB_FAKE_MESSAGES"
+  exit "${TGCB_FAKE_SEND_STATUS:-0}"
 fi
 EOF
 
@@ -64,6 +66,8 @@ fi
 while [ "$1" != --output-last-message ]; do shift; done
 output=$2
 cat > "$TGCB_FAKE_PROMPT"
+cat "$TGCB_FAKE_PROMPT" >> "$TGCB_FAKE_PROMPTS"
+echo >> "$TGCB_FAKE_PROMPTS"
 echo "$4" >> "$TGCB_FAKE_THREADS"
 echo 'Codex answer' > "$output"
 echo codex >> "$TGCB_FAKE_CALLS"
@@ -147,11 +151,79 @@ test "$(cat "$TGCB_HOME/offset")" = 12
 
 cat > "$TGCB_FAKE_UPDATES" <<'EOF'
 {"ok":true,"result":[
-  {"update_id":12,"message":{"chat":{"id":42,"type":"private"},"text":"Busy message"}}
+  {"update_id":12,"message":{"chat":{"id":42,"type":"private"},"text":"Binding failure"}}
 ]}
 EOF
-TGCB_FAKE_CODEX_BUSY=1 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run 2>"$SANDBOX/busy-error"
-case $(tail -1 "$TGCB_FAKE_MESSAGES") in *занят*) ;; *) echo 'FAIL: busy thread was not explained' >&2; exit 1 ;; esac
+mkdir "$TGCB_HOME/route-binding.tmp"
+binding_messages=$(wc -l < "$TGCB_FAKE_MESSAGES")
+expect 0 env TGCB_FAKE_CODEX_BUSY=1 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+test "$(cat "$TGCB_HOME/offset")" = 13
+test "$(wc -l < "$TGCB_FAKE_MESSAGES")" -gt "$binding_messages"
+case $(tail -2 "$TGCB_FAKE_MESSAGES") in *'Не удалось отложить сообщение. Повторите его.'*) ;; *) echo 'FAIL: binding failure was not explained' >&2; exit 1 ;; esac
+rmdir "$TGCB_HOME/route-binding.tmp"
+
+cat > "$TGCB_FAKE_UPDATES" <<'EOF'
+{"ok":true,"result":[
+  {"update_id":13,"message":{"chat":{"id":42,"type":"private"},"text":"Busy message"}},
+  {"update_id":14,"message":{"chat":{"id":43,"type":"private"},"text":"Later message"}}
+]}
+EOF
+busy_calls=$(wc -l < "$TGCB_FAKE_CALLS")
+busy_messages=$(wc -l < "$TGCB_FAKE_MESSAGES")
+busy_prompts=$(wc -l < "$TGCB_FAKE_PROMPTS")
+expect 75 env TGCB_FAKE_CODEX_BUSY=1 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+test "$(cat "$TGCB_HOME/offset")" = 13 || { echo 'FAIL: busy update was acknowledged' >&2; exit 1; }
+test "$(wc -l < "$TGCB_FAKE_CALLS")" = "$busy_calls" || { echo 'FAIL: busy update completed a Codex call' >&2; exit 1; }
+test "$(wc -l < "$TGCB_FAKE_MESSAGES")" = "$busy_messages" || { echo 'FAIL: busy update sent a reply' >&2; exit 1; }
+test "$(wc -l < "$TGCB_FAKE_PROMPTS")" = "$busy_prompts" || { echo 'FAIL: later update was processed after busy update' >&2; exit 1; }
+test -f "$TGCB_HOME/route-binding"
+test "$(stat -f '%Lp' "$TGCB_HOME/route-binding")" = 600
+test "$(sed -n 's/^UPDATE_ID=//p' "$TGCB_HOME/route-binding")" = 13
+test "$(sed -n 's/^THREAD_ID=//p' "$TGCB_HOME/route-binding")" = "${retargeted#codex://threads/}"
+if grep -q 'Busy message' "$TGCB_HOME/route-binding"; then
+  echo 'FAIL: busy message was persisted in route snapshot' >&2
+  exit 1
+fi
+
+expect 0 "$BRIDGE" 42 "$other"
+TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+test "$(cat "$TGCB_FAKE_PROMPT")" = 'Later message'
+test "$(sed -n '2p' "$TGCB_FAKE_PROMPTS")" = 'Busy message'
+test "$(sed -n '3p' "$TGCB_FAKE_PROMPTS")" = 'Later message'
+test "$(sed -n '2p' "$TGCB_FAKE_THREADS")" = "${retargeted#codex://threads/}"
+test "$(sed -n '3p' "$TGCB_FAKE_THREADS")" = "${other#codex://threads/}"
+test "$(grep -c '^codex$' "$TGCB_FAKE_CALLS")" = 3
+test "$(cat "$TGCB_HOME/offset")" = 15
+test ! -e "$TGCB_HOME/route-binding"
+
+cat > "$TGCB_FAKE_UPDATES" <<'EOF'
+{"ok":true,"result":[
+  {"update_id":15,"message":{"chat":{"id":42,"type":"private"},"text":"Cancelled message"}},
+  {"update_id":16,"message":{"chat":{"id":43,"type":"private"},"text":"After cancellation"}}
+]}
+EOF
+expect 75 env TGCB_FAKE_CODEX_BUSY=1 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+test "$(sed -n 's/^CHAT_ID=//p' "$TGCB_HOME/route-binding")" = 42 || { echo 'FAIL: busy binding omitted chat ID' >&2; exit 1; }
+expect 0 "$BRIDGE" stop 42
+expect 0 "$BRIDGE" 42 "$thread"
+TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+if grep -q 'Cancelled message' "$TGCB_FAKE_PROMPTS"; then
+  echo 'FAIL: stopped busy update was resumed after reconnect' >&2
+  exit 1
+fi
+test "$(sed -n '4p' "$TGCB_FAKE_PROMPTS")" = 'After cancellation'
+test "$(cat "$TGCB_HOME/offset")" = 17
+
+cat > "$TGCB_FAKE_UPDATES" <<'EOF'
+{"ok":true,"result":[
+  {"update_id":17,"message":{"chat":{"id":43,"type":"private"},"text":"Delivery error"}}
+]}
+EOF
+codex_calls=$(grep -c '^codex$' "$TGCB_FAKE_CALLS")
+expect 0 env TGCB_FAKE_SEND_STATUS=75 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+test "$(grep -c '^codex$' "$TGCB_FAKE_CALLS")" = $((codex_calls + 1))
+test "$(cat "$TGCB_HOME/offset")" = 18
+test ! -e "$TGCB_HOME/route-binding"
 
 expect 0 "$BRIDGE" stop 42
 expect 1 "$BRIDGE" status 42
