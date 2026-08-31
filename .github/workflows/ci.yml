@@ -1,4 +1,4 @@
-name: CI
+name: Tests and ShellCheck
 
 on:
   pull_request:
