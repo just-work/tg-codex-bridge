@@ -22,13 +22,16 @@ TELEGRAM_BOT_TOKEN=replace-me
 
 ## Commands
 
-```text
-tg-codex-bridge.sh CHAT_ID codex://threads/THREAD_ID
-tg-codex-bridge.sh status CHAT_ID
-tg-codex-bridge.sh stop CHAT_ID
+```bash
+BRIDGE=/absolute/path/to/tg-codex-bridge/tg-codex-bridge.sh
+cd /path/to/project
+"$BRIDGE" CHAT_ID codex://threads/THREAD_ID
+"$BRIDGE" status CHAT_ID
+"$BRIDGE" stop CHAT_ID
+"$BRIDGE" --help
 ```
 
-The first command creates or updates one route. `stop` removes that CHAT_ID; the shared listener stops after its last route. Telegram `/help` and `/status` are handled locally without starting Codex.
+Run the first command from the intended project or worktree: the route captures that working directory for Codex. Repeating its private `CHAT_ID` retargets it live for the next Telegram message without normally restarting the shared listener. Private chat IDs share that listener. `status` and `stop` are scoped to their `CHAT_ID`; stopping the final route stops the listener. Telegram `/help` and `/status` are handled locally only for configured private chats, without starting Codex.
 
 ## Security
 

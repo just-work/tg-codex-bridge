@@ -90,6 +90,12 @@ thread='codex://threads/00000000-0000-0000-0000-000000000000'
 other='codex://threads/11111111-1111-1111-1111-111111111111'
 retargeted='codex://threads/22222222-2222-2222-2222-222222222222'
 
+help_output=$($BRIDGE --help 2>&1) || { echo 'FAIL: --help exited nonzero' >&2; exit 1; }
+case $help_output in *Usage:*) ;; *) echo 'FAIL: --help omitted Usage' >&2; exit 1 ;; esac
+case $help_output in *'unbound variable'*) echo 'FAIL: --help emitted an unbound-variable error' >&2; exit 1 ;; esac
+expect 64 "$BRIDGE" --help extra
+expect 64 "$BRIDGE" -h extra
+
 chmod 644 "$TGCB_ENV"
 expect 64 "$BRIDGE" 42 "$thread"
 chmod 600 "$TGCB_ENV"
