@@ -18,6 +18,7 @@ export TGCB_FAKE_SERVICE="$SANDBOX/service"
 export TGCB_FAKE_CALLS="$SANDBOX/calls"
 export TGCB_FAKE_PROMPT="$SANDBOX/prompt"
 export TGCB_FAKE_UPDATES="$SANDBOX/updates.json"
+export TGCB_FAKE_MESSAGES="$SANDBOX/messages"
 mkdir -p "$HOME" "$SANDBOX/bin"
 
 cat > "$TGCB_LAUNCHCTL" <<'EOF'
@@ -37,11 +38,18 @@ if printf '%s' "$request" | grep -q getUpdates; then
   cat "$TGCB_FAKE_UPDATES"
 else
   echo send >> "$TGCB_FAKE_CALLS"
+  message=$(printf '%s\n' "$request" | sed -n 's/^data-urlencode = "text@\(.*\)"$/\1/p')
+  cat "$message" >> "$TGCB_FAKE_MESSAGES"
+  echo >> "$TGCB_FAKE_MESSAGES"
 fi
 EOF
 
 cat > "$TGCB_CODEX" <<'EOF'
 #!/bin/bash
+if [ "${TGCB_FAKE_CODEX_BUSY:-0}" = 1 ]; then
+  echo 'thread already has an active writer' >&2
+  exit 1
+fi
 while [ "$1" != --output-last-message ]; do shift; done
 output=$2
 cat > "$TGCB_FAKE_PROMPT"
@@ -84,6 +92,14 @@ test "$(cat "$TGCB_FAKE_PROMPT")" = 'Hello from Telegram'
 test "$(grep -c '^codex$' "$TGCB_FAKE_CALLS")" = 1
 test "$(grep -c '^send$' "$TGCB_FAKE_CALLS")" = 2
 test "$(cat "$TGCB_HOME/offset")" = 12
+
+cat > "$TGCB_FAKE_UPDATES" <<'EOF'
+{"ok":true,"result":[
+  {"update_id":12,"message":{"chat":{"id":42,"type":"private"},"text":"Busy message"}}
+]}
+EOF
+TGCB_FAKE_CODEX_BUSY=1 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run 2>"$SANDBOX/busy-error"
+case $(tail -1 "$TGCB_FAKE_MESSAGES") in *занят*) ;; *) echo 'FAIL: busy thread was not explained' >&2; exit 1 ;; esac
 
 expect 0 "$BRIDGE" stop 42
 expect 1 "$BRIDGE" status 42

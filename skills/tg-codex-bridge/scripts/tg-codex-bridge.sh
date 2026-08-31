@@ -153,16 +153,20 @@ send_message() {
 }
 
 run_codex() {
-  local text answer response
+  local text answer error response
   text=$1
   answer=$(/usr/bin/mktemp "$APP_DIR/answer.XXXXXX") || return 1
-  if (cd "$WORK_DIR" && printf '%s' "$text" | "$CODEX" exec --output-last-message "$answer" resume "$THREAD_ID" - >/dev/null); then
+  error=$(/usr/bin/mktemp "$APP_DIR/error.XXXXXX") || { /bin/rm -f "$answer"; return 1; }
+  if (cd "$WORK_DIR" && printf '%s' "$text" | "$CODEX" exec --output-last-message "$answer" resume "$THREAD_ID" - >/dev/null 2>"$error"); then
     response=$(/bin/cat "$answer")
     test -n "$response" || response='Codex завершил работу без ответа.'
+  elif /usr/bin/grep -q 'already has an active writer' "$error"; then
+    response='Codex thread занят в приложении. Переключитесь с него и повторите сообщение.'
   else
     response='Не удалось продолжить Codex thread.'
   fi
-  /bin/rm -f "$answer"
+  /bin/cat "$error" >&2
+  /bin/rm -f "$answer" "$error"
   send_message "$CHAT_ID" "$response"
 }
 
