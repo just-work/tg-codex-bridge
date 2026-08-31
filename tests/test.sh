@@ -16,6 +16,7 @@ export TGCB_CODEX="$SANDBOX/bin/codex"
 export TGCB_ENV="$SANDBOX/.env"
 export TGCB_FAKE_SERVICE="$SANDBOX/service"
 export TGCB_FAKE_LIFECYCLE="$SANDBOX/lifecycle"
+export TGCB_FAKE_FAIL_BOOTOUT="$SANDBOX/fail-bootout"
 export TGCB_FAKE_CALLS="$SANDBOX/calls"
 export TGCB_FAKE_PROMPT="$SANDBOX/prompt"
 export TGCB_FAKE_THREADS="$SANDBOX/threads"
@@ -26,8 +27,16 @@ mkdir -p "$HOME" "$SANDBOX/bin"
 cat > "$TGCB_LAUNCHCTL" <<'EOF'
 #!/bin/bash
 case "$1" in
-  bootstrap) echo "$1" >> "$TGCB_FAKE_LIFECYCLE"; : > "$TGCB_FAKE_SERVICE" ;;
-  bootout) echo "$1" >> "$TGCB_FAKE_LIFECYCLE"; rm -f "$TGCB_FAKE_SERVICE" ;;
+  bootstrap)
+    echo "$1" >> "$TGCB_FAKE_LIFECYCLE"
+    test ! -f "$TGCB_FAKE_SERVICE" || exit 1
+    : > "$TGCB_FAKE_SERVICE"
+    ;;
+  bootout)
+    echo "$1" >> "$TGCB_FAKE_LIFECYCLE"
+    if test -f "$TGCB_FAKE_FAIL_BOOTOUT"; then rm -f "$TGCB_FAKE_FAIL_BOOTOUT"; exit 1; fi
+    rm -f "$TGCB_FAKE_SERVICE"
+    ;;
   print) test -f "$TGCB_FAKE_SERVICE" ;;
 esac
 EOF
@@ -102,6 +111,19 @@ bootout
 bootstrap"
 test "$(cat "$TGCB_FAKE_LIFECYCLE")" = "$expected_lifecycle" || {
   echo 'FAIL: failed route update lost required runtime restart' >&2
+  exit 1
+}
+expect 0 "$BRIDGE" stop 44
+/usr/bin/printf 'old runtime\n' > "$TGCB_HOME/tg-codex-bridge.sh"
+: > "$TGCB_FAKE_FAIL_BOOTOUT"
+expect 1 "$BRIDGE" 44 "$thread"
+expect 0 "$BRIDGE" 44 "$thread"
+expected_lifecycle="$expected_lifecycle
+bootout
+bootout
+bootstrap"
+test "$(cat "$TGCB_FAKE_LIFECYCLE")" = "$expected_lifecycle" || {
+  echo 'FAIL: failed runtime reload was not retried' >&2
   exit 1
 }
 expect 0 "$BRIDGE" stop 44

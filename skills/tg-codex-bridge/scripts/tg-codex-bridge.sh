@@ -99,14 +99,16 @@ start_route() {
   runtime_changed=0
   if ! /usr/bin/cmp -s "$0" "$RUNTIME"; then
     runtime_temporary="$RUNTIME.tmp"
-    /bin/cp "$0" "$runtime_temporary" && /bin/chmod 700 "$runtime_temporary" &&
-      /bin/mv -f "$runtime_temporary" "$RUNTIME" || return 1
+    /bin/cp "$0" "$runtime_temporary" && /bin/chmod 700 "$runtime_temporary" || return 1
     runtime_changed=1
   fi
 
   if test "$runtime_changed" = 1; then
     write_plist || return 1
-    "$LAUNCHCTL" bootout "gui/$(/usr/bin/id -u)/$LABEL" >/dev/null 2>&1 || true
+    if "$LAUNCHCTL" print "gui/$(/usr/bin/id -u)/$LABEL" >/dev/null 2>&1; then
+      "$LAUNCHCTL" bootout "gui/$(/usr/bin/id -u)/$LABEL" >/dev/null 2>&1 || return 1
+    fi
+    /bin/mv -f "$runtime_temporary" "$RUNTIME" || return 1
     "$LAUNCHCTL" bootstrap "gui/$(/usr/bin/id -u)" "$PLIST" || return 1
   elif ! "$LAUNCHCTL" print "gui/$(/usr/bin/id -u)/$LABEL" >/dev/null 2>&1; then
     write_plist || return 1
