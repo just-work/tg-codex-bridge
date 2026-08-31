@@ -228,10 +228,11 @@ worker() {
 
 main() {
   case ${1:-} in
-    status) test "$#" -eq 2 || usage; status_route "${2:-}" ;;
-    stop) test "$#" -eq 2 || usage; stop_route "${2:-}" ;;
-    run) test "$#" -eq 1 || usage; worker ;;
-    *) test "$#" -eq 2 || usage; start_route "$1" "$2" ;;
+    -h|--help) test "$#" -eq 1 || { usage; return 64; }; usage; return 0 ;;
+    status) test "$#" -eq 2 || { usage; return 64; }; status_route "${2:-}" ;;
+    stop) test "$#" -eq 2 || { usage; return 64; }; stop_route "${2:-}" ;;
+    run) test "$#" -eq 1 || { usage; return 64; }; worker ;;
+    *) test "$#" -eq 2 || { usage; return 64; }; start_route "$1" "$2" ;;
   esac
 }
 
