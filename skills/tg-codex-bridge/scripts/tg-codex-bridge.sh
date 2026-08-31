@@ -89,6 +89,13 @@ start_route() {
 
   /bin/mkdir -p "$ROUTES_DIR"
   /bin/chmod 700 "$APP_DIR" "$ROUTES_DIR"
+  file=$(route_file "$chat")
+  temporary="$file.tmp"
+  {
+    printf 'THREAD_ID=%q\n' "$id"
+    printf 'WORK_DIR=%q\n' "$PWD"
+  } > "$temporary" && /bin/chmod 600 "$temporary" && /bin/mv -f "$temporary" "$file" || return 1
+
   runtime_changed=0
   if ! /usr/bin/cmp -s "$0" "$RUNTIME"; then
     runtime_temporary="$RUNTIME.tmp"
@@ -96,13 +103,6 @@ start_route() {
       /bin/mv -f "$runtime_temporary" "$RUNTIME" || return 1
     runtime_changed=1
   fi
-
-  file=$(route_file "$chat")
-  temporary="$file.tmp"
-  {
-    printf 'THREAD_ID=%q\n' "$id"
-    printf 'WORK_DIR=%q\n' "$PWD"
-  } > "$temporary" && /bin/chmod 600 "$temporary" && /bin/mv -f "$temporary" "$file" || return 1
 
   if test "$runtime_changed" = 1; then
     write_plist || return 1

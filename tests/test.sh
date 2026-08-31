@@ -92,6 +92,19 @@ test "$(cat "$TGCB_FAKE_LIFECYCLE")" = "$lifecycle" || {
   echo 'FAIL: unchanged runtime restarted worker' >&2
   exit 1
 }
+/usr/bin/printf 'old runtime\n' > "$TGCB_HOME/tg-codex-bridge.sh"
+/bin/mkdir "$TGCB_HOME/routes/44.tmp"
+expect 1 "$BRIDGE" 44 "$thread"
+/bin/rmdir "$TGCB_HOME/routes/44.tmp"
+expect 0 "$BRIDGE" 44 "$thread"
+expected_lifecycle="$lifecycle
+bootout
+bootstrap"
+test "$(cat "$TGCB_FAKE_LIFECYCLE")" = "$expected_lifecycle" || {
+  echo 'FAIL: failed route update lost required runtime restart' >&2
+  exit 1
+}
+expect 0 "$BRIDGE" stop 44
 test -x "$TGCB_HOME/tg-codex-bridge.sh"
 test -f "$TGCB_PLIST"
 status=$($BRIDGE status 42)
