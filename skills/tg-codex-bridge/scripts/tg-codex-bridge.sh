@@ -134,12 +134,19 @@ status_route() {
 }
 
 stop_route() {
-  local chat file remaining
+  local chat file remaining binding binding_chat
   chat=$1
   valid_chat "$chat" || return 64
   file=$(route_file "$chat")
   test -f "$file" || return 1
   /bin/rm -f "$file"
+  binding="$APP_DIR/route-binding"
+  if test -f "$binding"; then
+    binding_chat=$(/usr/bin/sed -n 's/^CHAT_ID=//p' "$binding")
+    if test "$binding_chat" = "$chat"; then
+      : > "$APP_DIR/route-binding.cancelled" || return 1
+    fi
+  fi
   remaining=$(/usr/bin/find "$ROUTES_DIR" -type f -maxdepth 1 2>/dev/null | /usr/bin/head -1)
   if test -z "$remaining"; then
     "$LAUNCHCTL" bootout "gui/$(/usr/bin/id -u)/$LABEL" >/dev/null 2>&1 || true
@@ -172,17 +179,19 @@ run_codex() {
     response=$(/bin/cat "$answer")
     test -n "$response" || response='Codex завершил работу без ответа.'
   elif /usr/bin/grep -q 'already has an active writer' "$error"; then
-    response='Codex thread занят в приложении. Переключитесь с него и повторите сообщение.'
+    /bin/rm -f "$answer" "$error"
+    return 75
   else
     response='Не удалось продолжить Codex thread.'
   fi
   /bin/cat "$error" >&2
   /bin/rm -f "$answer" "$error"
   send_message "$CHAT_ID" "$response"
+  return 0
 }
 
 worker() {
-  local offset response request update update_id file text
+  local offset response request update update_id file text result busy pending_update_id pending_match snapshot_temporary
   read_token || { printf '%s\n' 'Telegram credentials are unavailable.' >&2; return 1; }
   test -x "$CODEX" || CODEX=$(command -v codex) || return 1
   offset=0
@@ -202,26 +211,68 @@ worker() {
     fi
     /bin/rm -f "$request"
 
+    busy=0
     while IFS= read -r update; do
       update_id=$(printf '%s' "$update" | /usr/bin/jq -r '.update_id')
-      offset=$((update_id + 1))
-      printf '%s\n' "$offset" > "$APP_DIR/offset.tmp" && /bin/mv -f "$APP_DIR/offset.tmp" "$APP_DIR/offset"
-
       CHAT_ID=$(printf '%s' "$update" | /usr/bin/jq -r '.message.chat.id // empty | tostring')
-      test "$(printf '%s' "$update" | /usr/bin/jq -r '.message.chat.type // empty')" = private || continue
-      file=$(route_file "$CHAT_ID")
-      test -f "$file" || continue
-      text=$(printf '%s' "$update" | /usr/bin/jq -r '.message.text // empty')
-      test -n "$text" || continue
-      # shellcheck disable=SC1090
-      . "$file"
-      case $text in
-        /help) send_message "$CHAT_ID" 'Отправьте сообщение, чтобы продолжить связанный Codex thread. Команды: /help, /status.' ;;
-        /status) send_message "$CHAT_ID" "Bridge работает. Thread: codex://threads/$THREAD_ID" ;;
-        *) run_codex "$text" ;;
-      esac
+      pending_match=0
+      if test -f "$APP_DIR/route-binding"; then
+        pending_update_id=$(/usr/bin/sed -n 's/^UPDATE_ID=//p' "$APP_DIR/route-binding")
+        test "$pending_update_id" = "$update_id" && pending_match=1
+      fi
+      if test "$(printf '%s' "$update" | /usr/bin/jq -r '.message.chat.type // empty')" = private; then
+        file=$(route_file "$CHAT_ID")
+        if test -f "$file"; then
+          text=$(printf '%s' "$update" | /usr/bin/jq -r '.message.text // empty')
+          if test -n "$text"; then
+            if test "$pending_match" = 1; then
+              file="$APP_DIR/route-binding"
+            fi
+            # shellcheck disable=SC1090,SC1091
+            . "$file"
+            if test ! -f "$APP_DIR/route-binding.cancelled"; then case $text in
+              /help) send_message "$CHAT_ID" 'Отправьте сообщение, чтобы продолжить связанный Codex thread. Команды: /help, /status.' ;;
+              /status) send_message "$CHAT_ID" "Bridge работает. Thread: codex://threads/$THREAD_ID" ;;
+              *)
+                run_codex "$text"
+                result=$?
+                if test "$result" = 75; then
+                  if test "$pending_match" != 1; then
+                    snapshot_temporary="$APP_DIR/route-binding.tmp"
+                    if {
+                      printf 'UPDATE_ID=%q\n' "$update_id"
+                      printf 'CHAT_ID=%q\n' "$CHAT_ID"
+                      printf 'THREAD_ID=%q\n' "$THREAD_ID"
+                      printf 'WORK_DIR=%q\n' "$WORK_DIR"
+                    } > "$snapshot_temporary" &&
+                      /bin/chmod 600 "$snapshot_temporary" &&
+                      /bin/mv -f "$snapshot_temporary" "$APP_DIR/route-binding"; then
+                      busy=1
+                    else
+                      test ! -f "$snapshot_temporary" || /bin/rm -f "$snapshot_temporary"
+                      send_message "$CHAT_ID" 'Не удалось отложить сообщение. Повторите его.'
+                    fi
+                  else
+                    busy=1
+                  fi
+                fi
+                ;;
+            esac; fi
+          fi
+        fi
+      fi
+      test "$busy" = 1 && break
+      offset=$((update_id + 1))
+      if printf '%s\n' "$offset" > "$APP_DIR/offset.tmp" && /bin/mv -f "$APP_DIR/offset.tmp" "$APP_DIR/offset"; then
+        /bin/rm -f "$APP_DIR/route-binding" "$APP_DIR/route-binding.cancelled"
+      fi
     done < <(/usr/bin/jq -c '.result[]' "$response")
     /bin/rm -f "$response"
+    if test "$busy" = 1; then
+      test "${TGCB_ONCE:-0}" = 1 && return 75
+      /bin/sleep 5
+      continue
+    fi
     test "${TGCB_ONCE:-0}" = 1 && return 0
   done
 }

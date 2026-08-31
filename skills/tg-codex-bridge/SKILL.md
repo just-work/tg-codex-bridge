@@ -16,4 +16,6 @@ cd /path/to/codex-project
 "$BRIDGE" --help
 ```
 
-Connect, retarget, or stop a route only when the user authorizes it. Repeating a private `CHAT_ID` updates it live for the next Telegram message and normally does not restart the shared listener. Different private chat IDs share that listener. `status` and `stop` apply only to their `CHAT_ID`; stopping the last route stops the listener. Telegram `/help` and `/status` are local only for configured private chats.
+Act only with user authorization. Repeating a private `CHAT_ID` retargets the next Telegram message live and normally keeps the shared listener. Private chats share it. `status` and `stop` apply only to their `CHAT_ID`; stopping the last route stops it. Telegram `/help` and `/status` stay local for configured private chats.
+
+When a routed thread is active in Desktop, its update remains unacknowledged; later updates wait. Its originally captured thread/workdir stay bound if `CHAT_ID` is retargeted while it waits. After it frees, retry it as the next turn, then use current routes in order. Never inject into the active turn. Telegram is the ordered queue; local state only binds that busy update, never queues messages. A busy route blocks later shared-listener updates.
