@@ -1,6 +1,4 @@
-# tg-codex-bridge
-
-[![Tests and ShellCheck](https://github.com/just-work/tg-codex-bridge/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/just-work/tg-codex-bridge/actions/workflows/ci.yml)
+# tg-codex-bridge  [![Tests and ShellCheck](https://github.com/just-work/tg-codex-bridge/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/just-work/tg-codex-bridge/actions/workflows/ci.yml)
 
 ![tg-codex-bridge](assets/github-social.png)
 
