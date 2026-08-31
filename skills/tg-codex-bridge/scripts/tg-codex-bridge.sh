@@ -79,7 +79,7 @@ EOF
 }
 
 start_route() {
-  local chat uri id file temporary
+  local chat uri id file temporary runtime_temporary runtime_changed
   chat=$1
   uri=$2
   if ! valid_chat "$chat" || ! id=$(thread_id "$uri") || ! read_token; then
@@ -89,10 +89,6 @@ start_route() {
 
   /bin/mkdir -p "$ROUTES_DIR"
   /bin/chmod 700 "$APP_DIR" "$ROUTES_DIR"
-  if ! /usr/bin/cmp -s "$0" "$RUNTIME"; then
-    /bin/cp "$0" "$RUNTIME" && /bin/chmod 700 "$RUNTIME" || return 1
-  fi
-
   file=$(route_file "$chat")
   temporary="$file.tmp"
   {
@@ -100,9 +96,24 @@ start_route() {
     printf 'WORK_DIR=%q\n' "$PWD"
   } > "$temporary" && /bin/chmod 600 "$temporary" && /bin/mv -f "$temporary" "$file" || return 1
 
-  write_plist || return 1
-  "$LAUNCHCTL" bootout "gui/$(/usr/bin/id -u)/$LABEL" >/dev/null 2>&1 || true
-  "$LAUNCHCTL" bootstrap "gui/$(/usr/bin/id -u)" "$PLIST" || return 1
+  runtime_changed=0
+  if ! /usr/bin/cmp -s "$0" "$RUNTIME"; then
+    runtime_temporary="$RUNTIME.tmp"
+    /bin/cp "$0" "$runtime_temporary" && /bin/chmod 700 "$runtime_temporary" || return 1
+    runtime_changed=1
+  fi
+
+  if test "$runtime_changed" = 1; then
+    write_plist || return 1
+    if "$LAUNCHCTL" print "gui/$(/usr/bin/id -u)/$LABEL" >/dev/null 2>&1; then
+      "$LAUNCHCTL" bootout "gui/$(/usr/bin/id -u)/$LABEL" >/dev/null 2>&1 || return 1
+    fi
+    /bin/mv -f "$runtime_temporary" "$RUNTIME" || return 1
+    "$LAUNCHCTL" bootstrap "gui/$(/usr/bin/id -u)" "$PLIST" || return 1
+  elif ! "$LAUNCHCTL" print "gui/$(/usr/bin/id -u)/$LABEL" >/dev/null 2>&1; then
+    write_plist || return 1
+    "$LAUNCHCTL" bootstrap "gui/$(/usr/bin/id -u)" "$PLIST" || return 1
+  fi
   printf 'running: chat %s -> %s\n' "$chat" "$uri"
 }
 
