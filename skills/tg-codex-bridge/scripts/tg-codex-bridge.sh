@@ -219,6 +219,177 @@ run_codex() {
   return 0
 }
 
+app_server_call() {
+  local request temporary input output error server_pid line message_id status
+  request=$1
+  temporary=$(/usr/bin/mktemp -d "$APP_DIR/app-server.XXXXXX") || return 77
+  input="$temporary/input"
+  output="$temporary/output"
+  error="$temporary/error"
+  /usr/bin/mkfifo "$input" "$output" || {
+    /bin/rm -f "$input" "$output" "$error"
+    /bin/rmdir "$temporary" 2>/dev/null || true
+    return 77
+  }
+  "$CODEX" app-server --stdio < "$input" > "$output" 2>"$error" &
+  server_pid=$!
+  exec 8>"$input"
+  exec 9<>"$output"
+  printf '%s\n' '{"id":1,"method":"initialize","params":{"clientInfo":{"name":"tg-codex-bridge","version":"1"},"capabilities":{"experimentalApi":true}}}' >&8
+  status=77
+  while IFS= read -r -t 15 line <&9; do
+    message_id=$(printf '%s\n' "$line" | /usr/bin/jq -r '.id // empty' 2>/dev/null) || continue
+    test "$message_id" = 1 || continue
+    if printf '%s\n' "$line" | /usr/bin/jq -e '.error != null' >/dev/null 2>&1; then
+      status=76
+    elif printf '%s\n' "$line" | /usr/bin/jq -e '.result != null' >/dev/null 2>&1; then
+      status=0
+    fi
+    break
+  done
+  if test "$status" = 0; then
+    printf '%s\n' '{"method":"initialized"}' >&8
+    printf '%s\n' "$request" >&8
+    status=75
+    while IFS= read -r -t 30 line <&9; do
+      message_id=$(printf '%s\n' "$line" | /usr/bin/jq -r '.id // empty' 2>/dev/null) || continue
+      test "$message_id" = 2 || continue
+      if printf '%s\n' "$line" | /usr/bin/jq -e '.error != null' >/dev/null 2>&1; then
+        status=76
+      else
+        printf '%s\n' "$line"
+        status=0
+      fi
+      break
+    done
+  fi
+  exec 8>&-
+  exec 9<&-
+  /bin/kill "$server_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+  /bin/rm -f "$input" "$output" "$error"
+  /bin/rmdir "$temporary" 2>/dev/null || true
+  return "$status"
+}
+
+queue_codex() {
+  local text client request output status
+  text=$1
+  client=$2
+  request=$(printf '%s' "$text" | /usr/bin/jq -Rsc --arg thread "$THREAD_ID" --arg client "$client" '
+    {id:2,method:"thread/queue/add",params:{
+      threadId:$thread,
+      input:[{type:"text",text:.}],
+      clientUserMessageId:$client
+    }}') || return 77
+  if output=$(app_server_call "$request"); then
+    :
+  else
+    status=$?
+    return "$status"
+  fi
+  printf '%s\n' "$output" | /usr/bin/jq -e '
+    select(.id == 2)
+    | .result.queuedSubmission.id
+    | type == "string" and length > 0' >/dev/null 2>&1
+}
+
+queued_answer() {
+  local client cursor request output match matched answer
+  client=$1
+  cursor=
+  while :; do
+    request=$(/usr/bin/jq -cn --arg thread "$THREAD_ID" --arg cursor "$cursor" '
+      {id:2,method:"thread/turns/list",params:{threadId:$thread,limit:50,sortDirection:"desc",itemsView:"full"}}
+      | if $cursor == "" then . else .params.cursor = $cursor end') || return 75
+    output=$(app_server_call "$request") || return 75
+    match=$(printf '%s\n' "$output" | /usr/bin/jq -crs --arg client "$client" '
+      [.[]
+        | select(.id == 2)
+        | .result.data[]?
+        | select(any(.items[]?; .type == "userMessage" and .clientId == $client))] as $turns
+      | if ($turns | length) != 1 then {matched:false,answer:null}
+        elif $turns[0].status != "completed" then {matched:true,answer:null}
+        else [$turns[0].items[]?
+          | select(.type == "agentMessage" and .phase == "final_answer")
+          | .text] as $answers
+        | if ($answers | length) == 1 and ($answers[0] | type) == "string" and ($answers[0] | length) > 0
+          then {matched:true,answer:$answers[0]}
+          else {matched:true,answer:null}
+          end
+        end') || return 75
+    matched=$(printf '%s\n' "$match" | /usr/bin/jq -r '.matched') || return 75
+    if test "$matched" = true; then
+      answer=$(printf '%s\n' "$match" | /usr/bin/jq -jr '.answer // empty') || return 75
+      test -z "$answer" || printf '%s' "$answer"
+      return 0
+    fi
+    cursor=$(printf '%s\n' "$output" | /usr/bin/jq -jrs '[.[] | select(.id == 2) | .result.nextCursor // empty][0] // empty') || return 75
+    test -n "$cursor" || return 0
+  done
+}
+
+write_queue_binding() {
+  local state client update_id temporary
+  state=$1
+  client=$2
+  update_id=$3
+  temporary="$APP_DIR/route-binding.tmp"
+  {
+    printf 'UPDATE_ID=%q\n' "$update_id"
+    printf 'CHAT_ID=%q\n' "$CHAT_ID"
+    printf 'THREAD_ID=%q\n' "$THREAD_ID"
+    printf 'WORK_DIR=%q\n' "$WORK_DIR"
+    printf 'QUEUE_STATE=%q\n' "$state"
+    printf 'QUEUE_CLIENT_ID=%q\n' "$client"
+  } > "$temporary" && /bin/chmod 600 "$temporary" && /bin/mv -f "$temporary" "$APP_DIR/route-binding"
+}
+
+write_pending_binding() {
+  local update_id temporary
+  update_id=$1
+  temporary="$APP_DIR/route-binding.tmp"
+  {
+    printf 'UPDATE_ID=%q\n' "$update_id"
+    printf 'CHAT_ID=%q\n' "$CHAT_ID"
+    printf 'THREAD_ID=%q\n' "$THREAD_ID"
+    printf 'WORK_DIR=%q\n' "$WORK_DIR"
+  } > "$temporary" && /bin/chmod 600 "$temporary" && /bin/mv -f "$temporary" "$APP_DIR/route-binding"
+}
+
+run_queued_codex() {
+  local text update_id client answer status
+  text=$1
+  update_id=$2
+  case ${QUEUE_STATE:-} in
+    submitting|queued)
+      client=${QUEUE_CLIENT_ID:-}
+      test -n "$client" || return 75
+      ;;
+    '')
+      client=$(/usr/bin/uuidgen | tr '[:upper:]' '[:lower:]') || return 75
+      write_queue_binding submitting "$client" "$update_id" || return 75
+      if queue_codex "$text" "$client"; then
+        :
+      else
+        status=$?
+        if test "$status" = 76 || test "$status" = 77; then
+          write_pending_binding "$update_id" || return 75
+        fi
+        return 75
+      fi
+      write_queue_binding queued "$client" "$update_id" || return 75
+      QUEUE_STATE=queued
+      QUEUE_CLIENT_ID=$client
+      ;;
+    *) return 75 ;;
+  esac
+  answer=$(queued_answer "$client") || return 75
+  test -n "$answer" || return 75
+  test ! -f "$APP_DIR/route-binding.cancelled" || return 0
+  send_message "$CHAT_ID" "$answer" || return 75
+}
+
 worker() {
   local offset response request update update_id file text result busy pending_update_id pending_match snapshot_temporary
   read_token || { printf '%s\n' 'Telegram credentials are unavailable.' >&2; return 1; }
@@ -257,32 +428,41 @@ worker() {
             if test "$pending_match" = 1; then
               file="$APP_DIR/route-binding"
             fi
+            unset QUEUE_STATE QUEUE_CLIENT_ID
             # shellcheck disable=SC1090,SC1091
             . "$file"
             if test ! -f "$APP_DIR/route-binding.cancelled"; then case $text in
               /help) send_message "$CHAT_ID" 'Отправьте сообщение, чтобы продолжить связанный Codex thread. Команды: /help, /status.' ;;
               /status) send_message "$CHAT_ID" "Bridge работает. Thread: codex://threads/$THREAD_ID" ;;
               *)
-                run_codex "$text"
-                result=$?
-                if test "$result" = 75; then
-                  if test "$pending_match" != 1; then
-                    snapshot_temporary="$APP_DIR/route-binding.tmp"
-                    if {
-                      printf 'UPDATE_ID=%q\n' "$update_id"
-                      printf 'CHAT_ID=%q\n' "$CHAT_ID"
-                      printf 'THREAD_ID=%q\n' "$THREAD_ID"
-                      printf 'WORK_DIR=%q\n' "$WORK_DIR"
-                    } > "$snapshot_temporary" &&
-                      /bin/chmod 600 "$snapshot_temporary" &&
-                      /bin/mv -f "$snapshot_temporary" "$APP_DIR/route-binding"; then
-                      busy=1
+                if test "$pending_match" = 1 && test -n "${QUEUE_STATE:-}"; then
+                  run_queued_codex "$text" "$update_id"
+                  result=$?
+                  test "$result" = 75 && busy=1
+                else
+                  run_codex "$text"
+                  result=$?
+                  if test "$result" = 75; then
+                    if test "$pending_match" != 1; then
+                      snapshot_temporary="$APP_DIR/route-binding.tmp"
+                      if {
+                        printf 'UPDATE_ID=%q\n' "$update_id"
+                        printf 'CHAT_ID=%q\n' "$CHAT_ID"
+                        printf 'THREAD_ID=%q\n' "$THREAD_ID"
+                        printf 'WORK_DIR=%q\n' "$WORK_DIR"
+                      } > "$snapshot_temporary" &&
+                        /bin/chmod 600 "$snapshot_temporary" &&
+                        /bin/mv -f "$snapshot_temporary" "$APP_DIR/route-binding"; then
+                        busy=1
+                      else
+                        test ! -f "$snapshot_temporary" || /bin/rm -f "$snapshot_temporary"
+                        send_message "$CHAT_ID" 'Не удалось отложить сообщение. Повторите его.'
+                      fi
                     else
-                      test ! -f "$snapshot_temporary" || /bin/rm -f "$snapshot_temporary"
-                      send_message "$CHAT_ID" 'Не удалось отложить сообщение. Повторите его.'
+                      run_queued_codex "$text" "$update_id"
+                      result=$?
+                      test "$result" = 75 && busy=1
                     fi
-                  else
-                    busy=1
                   fi
                 fi
                 ;;
