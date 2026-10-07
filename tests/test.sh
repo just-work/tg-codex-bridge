@@ -18,6 +18,7 @@ export TGCB_FAKE_SERVICE="$SANDBOX/service"
 export TGCB_FAKE_LIFECYCLE="$SANDBOX/lifecycle"
 export TGCB_FAKE_FAIL_BOOTOUT="$SANDBOX/fail-bootout"
 export TGCB_FAKE_CALLS="$SANDBOX/calls"
+export TGCB_FAKE_ARGS="$SANDBOX/args"
 export TGCB_FAKE_PROMPT="$SANDBOX/prompt"
 export TGCB_FAKE_PROMPTS="$SANDBOX/prompts"
 export TGCB_FAKE_THREADS="$SANDBOX/threads"
@@ -59,16 +60,25 @@ EOF
 
 cat > "$TGCB_CODEX" <<'EOF'
 #!/bin/bash
+if [ "${1:-}" = --version ]; then
+  echo 'codex-cli test'
+  exit "${TGCB_FAKE_CODEX_VERSION_STATUS:-0}"
+fi
 if [ "${TGCB_FAKE_CODEX_BUSY:-0}" = 1 ]; then
   echo 'thread already has an active writer' >&2
   exit 1
 fi
+printf '%s\n' "$@" > "$TGCB_FAKE_ARGS"
 while [ "$1" != --output-last-message ]; do shift; done
 output=$2
+while [ "$1" != resume ]; do shift; done
+shift
+if [ "${1:-}" = --skip-git-repo-check ]; then shift; fi
+thread_id=$1
 cat > "$TGCB_FAKE_PROMPT"
 cat "$TGCB_FAKE_PROMPT" >> "$TGCB_FAKE_PROMPTS"
 echo >> "$TGCB_FAKE_PROMPTS"
-echo "$4" >> "$TGCB_FAKE_THREADS"
+echo "$thread_id" >> "$TGCB_FAKE_THREADS"
 echo 'Codex answer' > "$output"
 echo codex >> "$TGCB_FAKE_CALLS"
 EOF
@@ -103,7 +113,12 @@ expect 64 "$BRIDGE" -h extra
 chmod 644 "$TGCB_ENV"
 expect 64 "$BRIDGE" 42 "$thread"
 chmod 600 "$TGCB_ENV"
+expect 1 env TGCB_FAKE_CODEX_VERSION_STATUS=1 "$BRIDGE" 42 "$thread"
 expect 0 "$BRIDGE" 42 "$thread"
+grep -Fq '<key>TGCB_CODEX</key><string>'"$TGCB_CODEX"'</string>' "$TGCB_PLIST" || {
+  echo 'FAIL: LaunchAgent plist omitted the validated Codex executable' >&2
+  exit 1
+}
 lifecycle=$(cat "$TGCB_FAKE_LIFECYCLE")
 expect 0 "$BRIDGE" 43 "$other"
 expect 0 "$BRIDGE" 42 "$retargeted"
@@ -144,6 +159,10 @@ case $status in *running*"$retargeted"*) ;; *) exit 1 ;; esac
 
 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
 test "$(cat "$TGCB_FAKE_PROMPT")" = 'Hello from Telegram'
+grep -Fxq -- '--skip-git-repo-check' "$TGCB_FAKE_ARGS" || {
+  echo 'FAIL: Codex resume omitted --skip-git-repo-check for workspace roots' >&2
+  exit 1
+}
 test "$(cat "$TGCB_FAKE_THREADS")" = "${retargeted#codex://threads/}"
 test "$(grep -c '^codex$' "$TGCB_FAKE_CALLS")" = 1
 test "$(grep -c '^send$' "$TGCB_FAKE_CALLS")" = 2

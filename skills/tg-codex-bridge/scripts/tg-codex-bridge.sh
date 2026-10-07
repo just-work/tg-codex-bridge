@@ -11,7 +11,7 @@ LABEL=com.just-work.tg-codex-bridge
 ENV_FILE=${TGCB_ENV:-"$HOME/.config/tg-codex-bridge/.env"}
 LAUNCHCTL=${TGCB_LAUNCHCTL:-/bin/launchctl}
 CURL=${TGCB_CURL:-/usr/bin/curl}
-CODEX=${TGCB_CODEX:-/Applications/ChatGPT.app/Contents/Resources/codex}
+CODEX=${TGCB_CODEX:-}
 
 usage() {
   printf '%s\n' "Usage: $0 CHAT_ID codex://threads/THREAD_ID" \
@@ -49,13 +49,37 @@ xml() {
   /usr/bin/sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'
 }
 
+valid_codex() {
+  test -n "${1:-}" && test -x "$1" && "$1" --version >/dev/null 2>&1
+}
+
+resolve_codex() {
+  local candidate
+  if test -n "$CODEX"; then
+    valid_codex "$CODEX" || return 1
+    return 0
+  fi
+
+  for candidate in \
+    /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex \
+    /Applications/ChatGPT.app/Contents/Resources/codex \
+    "$(command -v codex 2>/dev/null || true)"; do
+    if valid_codex "$candidate"; then
+      CODEX=$candidate
+      return 0
+    fi
+  done
+  return 1
+}
+
 write_plist() {
-  local runtime app home codex_home env_file
+  local runtime app home codex_home env_file codex
   runtime=$(printf '%s' "$RUNTIME" | xml)
   app=$(printf '%s' "$APP_DIR" | xml)
   home=$(printf '%s' "$HOME" | xml)
   codex_home=$(printf '%s' "${CODEX_HOME:-$HOME/.codex}" | xml)
   env_file=$(printf '%s' "$ENV_FILE" | xml)
+  codex=$(printf '%s' "$CODEX" | xml)
   /bin/mkdir -p "$(/usr/bin/dirname "$PLIST")"
   /bin/cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -68,6 +92,7 @@ write_plist() {
 <key>CODEX_HOME</key><string>$codex_home</string>
 <key>TGCB_HOME</key><string>$app</string>
 <key>TGCB_ENV</key><string>$env_file</string>
+<key>TGCB_CODEX</key><string>$codex</string>
 </dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
 <key>ThrottleInterval</key><integer>5</integer>
@@ -85,6 +110,10 @@ start_route() {
   if ! valid_chat "$chat" || ! id=$(thread_id "$uri") || ! read_token; then
     printf '%s\n' 'Invalid chat, thread URI, or Telegram credentials.' >&2
     return 64
+  fi
+  if ! resolve_codex; then
+    printf '%s\n' 'Codex CLI is unavailable.' >&2
+    return 1
   fi
 
   /bin/mkdir -p "$ROUTES_DIR"
@@ -175,7 +204,7 @@ run_codex() {
   text=$1
   answer=$(/usr/bin/mktemp "$APP_DIR/answer.XXXXXX") || return 1
   error=$(/usr/bin/mktemp "$APP_DIR/error.XXXXXX") || { /bin/rm -f "$answer"; return 1; }
-  if (cd "$WORK_DIR" && printf '%s' "$text" | "$CODEX" exec --output-last-message "$answer" resume "$THREAD_ID" - >/dev/null 2>"$error"); then
+  if (cd "$WORK_DIR" && printf '%s' "$text" | "$CODEX" exec --output-last-message "$answer" resume --skip-git-repo-check "$THREAD_ID" - >/dev/null 2>"$error"); then
     response=$(/bin/cat "$answer")
     test -n "$response" || response='Codex завершил работу без ответа.'
   elif /usr/bin/grep -q 'already has an active writer' "$error"; then
@@ -193,7 +222,7 @@ run_codex() {
 worker() {
   local offset response request update update_id file text result busy pending_update_id pending_match snapshot_temporary
   read_token || { printf '%s\n' 'Telegram credentials are unavailable.' >&2; return 1; }
-  test -x "$CODEX" || CODEX=$(command -v codex) || return 1
+  resolve_codex || return 1
   offset=0
   test -f "$APP_DIR/offset" && offset=$(/bin/cat "$APP_DIR/offset")
 
