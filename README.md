@@ -33,6 +33,8 @@ cd /path/to/project
 
 Run the first command from the intended project or worktree: the route captures that working directory for Codex. Repeating its private `CHAT_ID` retargets it live for the next Telegram message without normally restarting the shared listener. Private chat IDs share that listener. `status` and `stop` are scoped to their `CHAT_ID`; stopping the final route stops the listener. Telegram `/help` and `/status` are handled locally only for configured private chats, without starting Codex.
 
+If a routed Codex thread is active in Desktop, its Telegram update stays unacknowledged and later updates wait. Its originally captured thread and worktree stay bound even if `CHAT_ID` is retargeted while it waits. Once the thread is free, the bridge retries it as the next Codex turn, then continues in order using current routes; it never injects into the active turn. Telegram is the ordered queue; local state only binds that busy update's route, never queues messages. A busy route blocks all later updates on the shared listener.
+
 ## Security
 
 - The token file must be owned by the current user, mode `0600`, and not a symlink.

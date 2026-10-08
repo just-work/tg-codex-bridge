@@ -18,7 +18,11 @@ export TGCB_FAKE_SERVICE="$SANDBOX/service"
 export TGCB_FAKE_LIFECYCLE="$SANDBOX/lifecycle"
 export TGCB_FAKE_FAIL_BOOTOUT="$SANDBOX/fail-bootout"
 export TGCB_FAKE_CALLS="$SANDBOX/calls"
+export TGCB_FAKE_ARGS="$SANDBOX/args"
+export TGCB_FAKE_APP_SERVER_CALLS="$SANDBOX/app-server-calls"
+export TGCB_FAKE_QUEUE_CLIENT="$SANDBOX/queue-client"
 export TGCB_FAKE_PROMPT="$SANDBOX/prompt"
+export TGCB_FAKE_PROMPTS="$SANDBOX/prompts"
 export TGCB_FAKE_THREADS="$SANDBOX/threads"
 export TGCB_FAKE_UPDATES="$SANDBOX/updates.json"
 export TGCB_FAKE_MESSAGES="$SANDBOX/messages"
@@ -52,19 +56,78 @@ else
   message=$(printf '%s\n' "$request" | sed -n 's/^data-urlencode = "text@\(.*\)"$/\1/p')
   cat "$message" >> "$TGCB_FAKE_MESSAGES"
   echo >> "$TGCB_FAKE_MESSAGES"
+  exit "${TGCB_FAKE_SEND_STATUS:-0}"
 fi
 EOF
 
 cat > "$TGCB_CODEX" <<'EOF'
 #!/bin/bash
-if [ "${TGCB_FAKE_CODEX_BUSY:-0}" = 1 ]; then
+if [ "${1:-}" = --version ]; then
+  echo 'codex-cli test'
+  exit "${TGCB_FAKE_CODEX_VERSION_STATUS:-0}"
+fi
+if [ "${1:-}" = app-server ]; then
+  IFS= read -r initialize || exit 2
+  printf '%s\n' "$initialize" | jq -e '
+    .method == "initialize" and .params.capabilities.experimentalApi == true' >/dev/null || exit 2
+  if IFS= read -r -t 1 premature; then
+    echo 'client sent initialized before initialize response' >&2
+    exit 2
+  fi
+  printf '%s\n' app-server >> "$TGCB_FAKE_APP_SERVER_CALLS"
+  if [ "${TGCB_FAKE_INIT_REJECT:-0}" = 1 ]; then
+    printf '%s\n' '{"id":1,"error":{"code":-32600,"message":"initialize rejected"}}'
+    exit 0
+  fi
+  printf '%s\n' '{"id":1,"result":{"userAgent":"fake"}}'
+  IFS= read -r initialized || exit 2
+  printf '%s\n' "$initialized" | jq -e '.method == "initialized"' >/dev/null || exit 2
+  IFS= read -r request || exit 2
+  if printf '%s\n' "$request" | grep -q 'thread/queue/add'; then
+    printf '%s\n' "$request" | jq -se '
+      .[0].method == "thread/queue/add"
+      and .[0].params.input == [{type:"text",text:"Busy message"}]' >/dev/null || exit 2
+    printf '%s\n' "$request" | jq -r '.params.clientUserMessageId' > "$TGCB_FAKE_QUEUE_CLIENT"
+    if [ "${TGCB_FAKE_QUEUE_REJECT:-0}" = 1 ]; then
+      printf '%s\n' '{"id":2,"error":{"code":-32602,"message":"queue rejected"}}'
+      exit 0
+    fi
+    printf '%s\n' '{"id":2,"result":{"queuedSubmission":{"id":"queued-test"}}}'
+  elif printf '%s\n' "$request" | grep -q 'thread/turns/list'; then
+    printf '%s\n' "$request" | jq -e '
+      .params.limit == 50
+      and .params.sortDirection == "desc"
+      and .params.itemsView == "full"' >/dev/null || exit 2
+    client=$(cat "$TGCB_FAKE_QUEUE_CLIENT")
+    cursor=$(printf '%s\n' "$request" | jq -r '.params.cursor // empty')
+    if [ "${TGCB_FAKE_QUEUE_READY:-0}" = 1 ]; then
+      if [ "${TGCB_FAKE_QUEUE_PAGED:-0}" = 1 ] && [ -z "$cursor" ]; then
+        printf '%s\n' '{"id":2,"result":{"data":[{"id":"unrelated","status":"completed","items":[{"id":"unrelated-user","type":"userMessage","clientId":"different-client"},{"id":"unrelated-assistant","type":"agentMessage","phase":"final_answer","text":"Wrong answer"}]}],"nextCursor":"page-2"}}'
+      else
+        test -z "$cursor" || test "$cursor" = page-2 || exit 2
+        jq -cn --arg client "$client" '{id:2,result:{data:[{id:"turn-test",status:"completed",items:[{id:"user-test",type:"userMessage",clientId:$client,content:[{type:"text",text:"Busy message"}]},{id:"assistant-test",type:"agentMessage",phase:"final_answer",text:"Queued answer"}]}],nextCursor:null}}'
+      fi
+    else
+      printf '%s\n' '{"id":2,"result":{"data":[],"nextCursor":null}}'
+    fi
+  fi
+  exit 0
+fi
+if [ "${TGCB_FAKE_CODEX_BUSY:-0}" = 1 ] && [ "${1:-}" = exec ]; then
   echo 'thread already has an active writer' >&2
   exit 1
 fi
+printf '%s\n' "$@" > "$TGCB_FAKE_ARGS"
 while [ "$1" != --output-last-message ]; do shift; done
 output=$2
+while [ "$1" != resume ]; do shift; done
+shift
+if [ "${1:-}" = --skip-git-repo-check ]; then shift; fi
+thread_id=$1
 cat > "$TGCB_FAKE_PROMPT"
-echo "$4" >> "$TGCB_FAKE_THREADS"
+cat "$TGCB_FAKE_PROMPT" >> "$TGCB_FAKE_PROMPTS"
+echo >> "$TGCB_FAKE_PROMPTS"
+echo "$thread_id" >> "$TGCB_FAKE_THREADS"
 echo 'Codex answer' > "$output"
 echo codex >> "$TGCB_FAKE_CALLS"
 EOF
@@ -99,7 +162,12 @@ expect 64 "$BRIDGE" -h extra
 chmod 644 "$TGCB_ENV"
 expect 64 "$BRIDGE" 42 "$thread"
 chmod 600 "$TGCB_ENV"
+expect 1 env TGCB_FAKE_CODEX_VERSION_STATUS=1 "$BRIDGE" 42 "$thread"
 expect 0 "$BRIDGE" 42 "$thread"
+grep -Fq '<key>TGCB_CODEX</key><string>'"$TGCB_CODEX"'</string>' "$TGCB_PLIST" || {
+  echo 'FAIL: LaunchAgent plist omitted the validated Codex executable' >&2
+  exit 1
+}
 lifecycle=$(cat "$TGCB_FAKE_LIFECYCLE")
 expect 0 "$BRIDGE" 43 "$other"
 expect 0 "$BRIDGE" 42 "$retargeted"
@@ -140,6 +208,10 @@ case $status in *running*"$retargeted"*) ;; *) exit 1 ;; esac
 
 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
 test "$(cat "$TGCB_FAKE_PROMPT")" = 'Hello from Telegram'
+grep -Fxq -- '--skip-git-repo-check' "$TGCB_FAKE_ARGS" || {
+  echo 'FAIL: Codex resume omitted --skip-git-repo-check for workspace roots' >&2
+  exit 1
+}
 test "$(cat "$TGCB_FAKE_THREADS")" = "${retargeted#codex://threads/}"
 test "$(grep -c '^codex$' "$TGCB_FAKE_CALLS")" = 1
 test "$(grep -c '^send$' "$TGCB_FAKE_CALLS")" = 2
@@ -147,11 +219,120 @@ test "$(cat "$TGCB_HOME/offset")" = 12
 
 cat > "$TGCB_FAKE_UPDATES" <<'EOF'
 {"ok":true,"result":[
-  {"update_id":12,"message":{"chat":{"id":42,"type":"private"},"text":"Busy message"}}
+  {"update_id":12,"message":{"chat":{"id":42,"type":"private"},"text":"Binding failure"}}
 ]}
 EOF
-TGCB_FAKE_CODEX_BUSY=1 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run 2>"$SANDBOX/busy-error"
-case $(tail -1 "$TGCB_FAKE_MESSAGES") in *занят*) ;; *) echo 'FAIL: busy thread was not explained' >&2; exit 1 ;; esac
+mkdir "$TGCB_HOME/route-binding.tmp"
+binding_messages=$(wc -l < "$TGCB_FAKE_MESSAGES")
+expect 0 env TGCB_FAKE_CODEX_BUSY=1 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+test "$(cat "$TGCB_HOME/offset")" = 13
+test "$(wc -l < "$TGCB_FAKE_MESSAGES")" -gt "$binding_messages"
+case $(tail -2 "$TGCB_FAKE_MESSAGES") in *'Не удалось отложить сообщение. Повторите его.'*) ;; *) echo 'FAIL: binding failure was not explained' >&2; exit 1 ;; esac
+rmdir "$TGCB_HOME/route-binding.tmp"
+
+cat > "$TGCB_FAKE_UPDATES" <<'EOF'
+{"ok":true,"result":[
+  {"update_id":13,"message":{"chat":{"id":42,"type":"private"},"text":"Busy message"}}
+]}
+EOF
+busy_calls=$(wc -l < "$TGCB_FAKE_CALLS")
+busy_messages=$(wc -l < "$TGCB_FAKE_MESSAGES")
+busy_prompts=$(wc -l < "$TGCB_FAKE_PROMPTS")
+expect 75 env TGCB_FAKE_CODEX_BUSY=1 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+test "$(cat "$TGCB_HOME/offset")" = 13 || { echo 'FAIL: busy update was acknowledged' >&2; exit 1; }
+test "$(wc -l < "$TGCB_FAKE_CALLS")" = "$busy_calls" || { echo 'FAIL: busy update completed a Codex call' >&2; exit 1; }
+test "$(wc -l < "$TGCB_FAKE_MESSAGES")" = "$busy_messages" || { echo 'FAIL: busy update sent a reply' >&2; exit 1; }
+test "$(wc -l < "$TGCB_FAKE_PROMPTS")" = "$busy_prompts" || { echo 'FAIL: later update was processed after busy update' >&2; exit 1; }
+test -f "$TGCB_HOME/route-binding"
+test "$(stat -f '%Lp' "$TGCB_HOME/route-binding")" = 600
+test "$(sed -n 's/^UPDATE_ID=//p' "$TGCB_HOME/route-binding")" = 13
+test "$(sed -n 's/^THREAD_ID=//p' "$TGCB_HOME/route-binding")" = "${retargeted#codex://threads/}"
+if grep -q 'Busy message' "$TGCB_HOME/route-binding"; then
+  echo 'FAIL: busy message was persisted in route snapshot' >&2
+  exit 1
+fi
+
+expect 0 "$BRIDGE" 42 "$other"
+queue_calls=0
+test ! -f "$TGCB_FAKE_APP_SERVER_CALLS" || queue_calls=$(wc -l < "$TGCB_FAKE_APP_SERVER_CALLS")
+expect 75 env TGCB_FAKE_CODEX_BUSY=1 TGCB_FAKE_QUEUE_REJECT=1 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+test "$(wc -l < "$TGCB_FAKE_APP_SERVER_CALLS")" -eq "$((queue_calls + 1))" || {
+  echo 'FAIL: rejected queue submission was not attempted exactly once' >&2
+  exit 1
+}
+if grep -q '^QUEUE_' "$TGCB_HOME/route-binding"; then
+  echo 'FAIL: explicit queue rejection left a stranded queue state' >&2
+  exit 1
+fi
+test "$(cat "$TGCB_HOME/offset")" = 13 || { echo 'FAIL: rejected queue update was acknowledged' >&2; exit 1; }
+
+expect 75 env TGCB_FAKE_CODEX_BUSY=1 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+test "$(grep -c '^app-server$' "$TGCB_FAKE_APP_SERVER_CALLS")" -eq "$((queue_calls + 3))" || {
+  echo 'FAIL: queued fallback did not submit once and poll once' >&2
+  exit 1
+}
+test "$(sed -n 's/^QUEUE_STATE=//p' "$TGCB_HOME/route-binding")" = queued
+if grep -q 'Busy message\|Queued answer' "$TGCB_HOME/route-binding"; then
+  echo 'FAIL: queued binding persisted prompt or answer' >&2
+  exit 1
+fi
+/usr/bin/sed 's/^QUEUE_STATE=.*/QUEUE_STATE=submitting/' "$TGCB_HOME/route-binding" > "$TGCB_HOME/route-binding.tmp"
+/bin/chmod 600 "$TGCB_HOME/route-binding.tmp"
+/bin/mv -f "$TGCB_HOME/route-binding.tmp" "$TGCB_HOME/route-binding"
+expect 0 env TGCB_FAKE_CODEX_BUSY=1 TGCB_FAKE_QUEUE_READY=1 TGCB_FAKE_QUEUE_PAGED=1 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+test "$(grep -c '^app-server$' "$TGCB_FAKE_APP_SERVER_CALLS")" -eq "$((queue_calls + 5))" || {
+  echo 'FAIL: queued replay resubmitted instead of polling' >&2
+  exit 1
+}
+case $(tail -2 "$TGCB_FAKE_MESSAGES") in *'Queued answer'*) ;; *) echo 'FAIL: queued final answer was not sent' >&2; exit 1 ;; esac
+case $(tail -2 "$TGCB_FAKE_MESSAGES") in *'Wrong answer'*) echo 'FAIL: unrelated queued answer was sent' >&2; exit 1 ;; esac
+test "$(cat "$TGCB_HOME/offset")" = 14
+test ! -e "$TGCB_HOME/route-binding"
+test -z "$(find "$TGCB_HOME" -maxdepth 1 -name 'app-server.*' -print)" || {
+  echo 'FAIL: app-server response was persisted on disk' >&2
+  exit 1
+}
+
+cat > "$TGCB_FAKE_UPDATES" <<'EOF'
+{"ok":true,"result":[
+  {"update_id":14,"message":{"chat":{"id":43,"type":"private"},"text":"Later message"}}
+]}
+EOF
+TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+test "$(cat "$TGCB_FAKE_PROMPT")" = 'Later message'
+test "$(sed -n '2p' "$TGCB_FAKE_PROMPTS")" = 'Later message'
+test "$(sed -n '2p' "$TGCB_FAKE_THREADS")" = "${other#codex://threads/}"
+test "$(grep -c '^codex$' "$TGCB_FAKE_CALLS")" = 2
+test "$(cat "$TGCB_HOME/offset")" = 15
+
+cat > "$TGCB_FAKE_UPDATES" <<'EOF'
+{"ok":true,"result":[
+  {"update_id":15,"message":{"chat":{"id":42,"type":"private"},"text":"Cancelled message"}},
+  {"update_id":16,"message":{"chat":{"id":43,"type":"private"},"text":"After cancellation"}}
+]}
+EOF
+expect 75 env TGCB_FAKE_CODEX_BUSY=1 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+test "$(sed -n 's/^CHAT_ID=//p' "$TGCB_HOME/route-binding")" = 42 || { echo 'FAIL: busy binding omitted chat ID' >&2; exit 1; }
+expect 0 "$BRIDGE" stop 42
+expect 0 "$BRIDGE" 42 "$thread"
+TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+if grep -q 'Cancelled message' "$TGCB_FAKE_PROMPTS"; then
+  echo 'FAIL: stopped busy update was resumed after reconnect' >&2
+  exit 1
+fi
+test "$(sed -n '3p' "$TGCB_FAKE_PROMPTS")" = 'After cancellation'
+test "$(cat "$TGCB_HOME/offset")" = 17
+
+cat > "$TGCB_FAKE_UPDATES" <<'EOF'
+{"ok":true,"result":[
+  {"update_id":17,"message":{"chat":{"id":43,"type":"private"},"text":"Delivery error"}}
+]}
+EOF
+codex_calls=$(grep -c '^codex$' "$TGCB_FAKE_CALLS")
+expect 0 env TGCB_FAKE_SEND_STATUS=75 TGCB_ONCE=1 "$TGCB_HOME/tg-codex-bridge.sh" run
+test "$(grep -c '^codex$' "$TGCB_FAKE_CALLS")" = $((codex_calls + 1))
+test "$(cat "$TGCB_HOME/offset")" = 18
+test ! -e "$TGCB_HOME/route-binding"
 
 expect 0 "$BRIDGE" stop 42
 expect 1 "$BRIDGE" status 42
